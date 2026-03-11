@@ -6,7 +6,7 @@ const options: swaggerJsdoc.Options = {
     info: {
       title: "Products API",
       version: "1.0.0",
-      description: "A simple CRUD REST API for managing products",
+      description: "A CRUD REST API for managing products. Supports full update (PUT) and partial update (PATCH).",
     },
     components: {
       schemas: {

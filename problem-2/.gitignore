@@ -4,6 +4,9 @@ node_modules/
 # Build output
 dist/
 
+# Drizzle generated migrations (optional: remove this line if you want to commit migrations)
+drizzle/
+
 # SQLite database
 *.db
 *.db-shm

@@ -16,11 +16,16 @@ export const updateProductSchema = z.object({
   stock: z.number().int().min(0).optional(),
 });
 
+export const SORTABLE_FIELDS = ["name", "price", "stock", "category", "createdAt"] as const;
+export type SortableField = typeof SORTABLE_FIELDS[number];
+
 export const listProductsSchema = z.object({
   category: z.string().optional(),
   minPrice: z.coerce.number().positive().optional(),
   maxPrice: z.coerce.number().positive().optional(),
   search: z.string().optional(),
+  sortBy: z.enum(SORTABLE_FIELDS).default("createdAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
   page: z.coerce.number().int().positive().default(1),
   limit: z.coerce.number().int().min(1).max(100).default(10),
 });
