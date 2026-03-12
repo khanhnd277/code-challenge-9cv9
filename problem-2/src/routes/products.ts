@@ -6,9 +6,10 @@
  */
 
 import { and, asc, desc, eq, gte, lte, or, sql } from "drizzle-orm";
-import { Router, type Request, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import { randomUUID } from "crypto";
 import { db, products } from "../db";
+import { AppError } from "../errors/AppError";
 import {
   createProductSchema,
   listProductsSchema,
@@ -47,25 +48,29 @@ const router = Router();
  *               $ref: '#/components/schemas/ValidationError'
  */
 // POST /api/products — Create a product
-router.post("/", async (req: Request, res: Response) => {
-  const parsed = createProductSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: "Validation failed",
-      details: parsed.error.flatten().fieldErrors,
-    });
+router.post("/", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const parsed = createProductSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+
+    const now = new Date().toISOString();
+    const newProduct = {
+      id: randomUUID(),
+      ...parsed.data,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const [created] = await db.insert(products).values(newProduct).returning();
+    return res.status(201).json({ data: created });
+  } catch (err) {
+    next(err);
   }
-
-  const now = new Date().toISOString();
-  const newProduct = {
-    id: randomUUID(),
-    ...parsed.data,
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  const [created] = await db.insert(products).values(newProduct).returning();
-  return res.status(201).json({ data: created });
 });
 
 /**
@@ -136,62 +141,66 @@ router.post("/", async (req: Request, res: Response) => {
  *               $ref: '#/components/schemas/ValidationError'
  */
 // GET /api/products — List products with filters
-router.get("/", async (req: Request, res: Response) => {
-  const parsed = listProductsSchema.safeParse(req.query);
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: "Invalid query parameters",
-      details: parsed.error.flatten().fieldErrors,
+router.get("/", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const parsed = listProductsSchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "Invalid query parameters",
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+
+    const { category, minPrice, maxPrice, search, sortBy, sortOrder, page, limit } = parsed.data;
+    const offset = (page - 1) * limit;
+
+    const conditions = [];
+    if (category) conditions.push(eq(products.category, category));
+    if (minPrice !== undefined) conditions.push(gte(products.price, minPrice));
+    if (maxPrice !== undefined) conditions.push(lte(products.price, maxPrice));
+    if (search) {
+      const term = `%${search.toLowerCase()}%`;
+      conditions.push(
+        or(
+          sql`lower(${products.name}) like ${term}`,
+          sql`lower(${products.description}) like ${term}`
+        )
+      );
+    }
+
+    const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const sortColumn = products[sortBy as keyof typeof products] as Parameters<typeof asc>[0];
+    const orderBy = sortOrder === "asc" ? asc(sortColumn) : desc(sortColumn);
+
+    const [rows, countResult] = await Promise.all([
+      db
+        .select()
+        .from(products)
+        .where(where)
+        .orderBy(orderBy)
+        .limit(limit)
+        .offset(offset),
+      db
+        .select({ count: sql<number>`count(*)` })
+        .from(products)
+        .where(where),
+    ]);
+
+    const total = Number(countResult[0]?.count ?? 0);
+
+    return res.json({
+      data: rows,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
     });
+  } catch (err) {
+    next(err);
   }
-
-  const { category, minPrice, maxPrice, search, sortBy, sortOrder, page, limit } = parsed.data;
-  const offset = (page - 1) * limit;
-
-  const conditions = [];
-  if (category) conditions.push(eq(products.category, category));
-  if (minPrice !== undefined) conditions.push(gte(products.price, minPrice));
-  if (maxPrice !== undefined) conditions.push(lte(products.price, maxPrice));
-  if (search) {
-    const term = `%${search.toLowerCase()}%`;
-    conditions.push(
-      or(
-        sql`lower(${products.name}) like ${term}`,
-        sql`lower(${products.description}) like ${term}`
-      )
-    );
-  }
-
-  const where = conditions.length > 0 ? and(...conditions) : undefined;
-
-  const sortColumn = products[sortBy as keyof typeof products] as Parameters<typeof asc>[0];
-  const orderBy = sortOrder === "asc" ? asc(sortColumn) : desc(sortColumn);
-
-  const [rows, countResult] = await Promise.all([
-    db
-      .select()
-      .from(products)
-      .where(where)
-      .orderBy(orderBy)
-      .limit(limit)
-      .offset(offset),
-    db
-      .select({ count: sql<number>`count(*)` })
-      .from(products)
-      .where(where),
-  ]);
-
-  const total = Number(countResult[0]?.count ?? 0);
-
-  return res.json({
-    data: rows,
-    pagination: {
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit),
-    },
-  });
 });
 
 /**
@@ -225,18 +234,20 @@ router.get("/", async (req: Request, res: Response) => {
  *               $ref: '#/components/schemas/NotFoundError'
  */
 // GET /api/products/:id — Get product by ID
-router.get("/:id", async (req: Request, res: Response) => {
-  const [product] = await db
-    .select()
-    .from(products)
-    .where(eq(products.id, req.params.id))
-    .limit(1);
+router.get("/:id", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const [product] = await db
+      .select()
+      .from(products)
+      .where(eq(products.id, req.params.id))
+      .limit(1);
 
-  if (!product) {
-    return res.status(404).json({ error: "Product not found" });
+    if (!product) throw new AppError(404, "Product not found");
+
+    return res.json({ data: product });
+  } catch (err) {
+    next(err);
   }
-
-  return res.json({ data: product });
 });
 
 /**
@@ -282,36 +293,38 @@ router.get("/:id", async (req: Request, res: Response) => {
  *               $ref: '#/components/schemas/NotFoundError'
  */
 // PUT /api/products/:id — Update a product
-router.put("/:id", async (req: Request, res: Response) => {
-  const [existing] = await db
-    .select()
-    .from(products)
-    .where(eq(products.id, req.params.id))
-    .limit(1);
+router.put("/:id", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const [existing] = await db
+      .select()
+      .from(products)
+      .where(eq(products.id, req.params.id))
+      .limit(1);
 
-  if (!existing) {
-    return res.status(404).json({ error: "Product not found" });
+    if (!existing) throw new AppError(404, "Product not found");
+
+    const parsed = updateProductSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+
+    if (Object.keys(parsed.data).length === 0) {
+      throw new AppError(400, "No fields to update");
+    }
+
+    const [updated] = await db
+      .update(products)
+      .set({ ...parsed.data, updatedAt: new Date().toISOString() })
+      .where(eq(products.id, req.params.id))
+      .returning();
+
+    return res.json({ data: updated });
+  } catch (err) {
+    next(err);
   }
-
-  const parsed = updateProductSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: "Validation failed",
-      details: parsed.error.flatten().fieldErrors,
-    });
-  }
-
-  if (Object.keys(parsed.data).length === 0) {
-    return res.status(400).json({ error: "No fields to update" });
-  }
-
-  const [updated] = await db
-    .update(products)
-    .set({ ...parsed.data, updatedAt: new Date().toISOString() })
-    .where(eq(products.id, req.params.id))
-    .returning();
-
-  return res.json({ data: updated });
 });
 
 /**
@@ -362,36 +375,38 @@ router.put("/:id", async (req: Request, res: Response) => {
  *               $ref: '#/components/schemas/NotFoundError'
  */
 // PATCH /api/products/:id — Partially update a product
-router.patch("/:id", async (req: Request, res: Response) => {
-  const [existing] = await db
-    .select()
-    .from(products)
-    .where(eq(products.id, req.params.id))
-    .limit(1);
+router.patch("/:id", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const [existing] = await db
+      .select()
+      .from(products)
+      .where(eq(products.id, req.params.id))
+      .limit(1);
 
-  if (!existing) {
-    return res.status(404).json({ error: "Product not found" });
+    if (!existing) throw new AppError(404, "Product not found");
+
+    const parsed = updateProductSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+
+    if (Object.keys(parsed.data).length === 0) {
+      throw new AppError(400, "No fields to update");
+    }
+
+    const [updated] = await db
+      .update(products)
+      .set({ ...parsed.data, updatedAt: new Date().toISOString() })
+      .where(eq(products.id, req.params.id))
+      .returning();
+
+    return res.json({ data: updated });
+  } catch (err) {
+    next(err);
   }
-
-  const parsed = updateProductSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: "Validation failed",
-      details: parsed.error.flatten().fieldErrors,
-    });
-  }
-
-  if (Object.keys(parsed.data).length === 0) {
-    return res.status(400).json({ error: "No fields to update" });
-  }
-
-  const [updated] = await db
-    .update(products)
-    .set({ ...parsed.data, updatedAt: new Date().toISOString() })
-    .where(eq(products.id, req.params.id))
-    .returning();
-
-  return res.json({ data: updated });
 });
 
 /**
@@ -418,20 +433,22 @@ router.patch("/:id", async (req: Request, res: Response) => {
  *               $ref: '#/components/schemas/NotFoundError'
  */
 // DELETE /api/products/:id — Delete a product
-router.delete("/:id", async (req: Request, res: Response) => {
-  const [existing] = await db
-    .select()
-    .from(products)
-    .where(eq(products.id, req.params.id))
-    .limit(1);
+router.delete("/:id", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const [existing] = await db
+      .select()
+      .from(products)
+      .where(eq(products.id, req.params.id))
+      .limit(1);
 
-  if (!existing) {
-    return res.status(404).json({ error: "Product not found" });
+    if (!existing) throw new AppError(404, "Product not found");
+
+    await db.delete(products).where(eq(products.id, req.params.id));
+
+    return res.status(204).send();
+  } catch (err) {
+    next(err);
   }
-
-  await db.delete(products).where(eq(products.id, req.params.id));
-
-  return res.status(204).send();
 });
 
 export default router;

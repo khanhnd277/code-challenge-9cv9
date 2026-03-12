@@ -75,7 +75,12 @@ const options: swaggerJsdoc.Options = {
       },
     },
   },
-  apis: ["./src/routes/*.ts"],
+  // In development/test: parse TypeScript source files directly.
+  // In production (Docker): src/ is absent, fall back to compiled JS in dist/.
+  apis:
+    process.env["NODE_ENV"] === "production"
+      ? ["./dist/routes/*.js"]
+      : ["./src/routes/*.ts"],
 };
 
 export const swaggerSpec = swaggerJsdoc(options);

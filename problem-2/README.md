@@ -6,10 +6,53 @@ A RESTful CRUD API built with **Express.js**, **TypeScript**, **Drizzle ORM**, *
 
 - Node.js >= 18
 - npm >= 9
+- Docker & Docker Compose (for containerised deployment)
 
 ---
 
-## Setup & Run
+## Docker (recommended)
+
+The fastest way to run the full stack (app + PostgreSQL) with zero local setup.
+
+### Start
+
+```bash
+docker compose up --build
+```
+
+- App: `http://localhost:3000`
+- API docs: `http://localhost:3000/api-docs`
+- PostgreSQL: `localhost:5432` (user `products_user`, db `products_db`)
+
+On first start the app automatically pushes the schema to PostgreSQL before starting.
+
+### Seed sample data
+
+```bash
+docker compose exec app node dist/db/seed.js
+```
+
+### Stop
+
+```bash
+docker compose down        # stop, keep DB volume
+docker compose down -v     # stop and wipe DB volume (deletes all data)
+```
+
+### Built-in environment
+
+All environment variables are defined directly in [docker-compose.yml](docker-compose.yml) — no `.env` file needed when using Docker.
+
+| Variable | Docker value |
+|---|---|
+| `NODE_ENV` | `production` |
+| `PORT` | `3000` |
+| `LOG_LEVEL` | `info` |
+| `DATABASE_URL` | `postgres://products_user:products_pass@db:5432/products_db` |
+
+---
+
+## Setup & Run (local)
 
 ### 1. Install dependencies
 
@@ -143,188 +186,10 @@ npm run test:coverage  # generate coverage report in ./coverage/
 
 ## API Reference
 
-Interactive docs (Swagger UI): `http://localhost:3000/api-docs`
-Raw OpenAPI JSON spec: `http://localhost:3000/api-docs.json`
+Full interactive documentation with request/response schemas and a built-in request runner is available via Swagger UI once the server is running:
 
-Base URL: `http://localhost:3000/api`
-
-### Health check
-
-```
-GET /health
-```
-
----
-
-### Products
-
-#### Create a product
-
-```
-POST /api/products
-Content-Type: application/json
-```
-
-**Request body:**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `name` | string | Yes | Product name (max 255) |
-| `description` | string | No | Description (max 1000) |
-| `price` | number | Yes | Must be positive |
-| `category` | string | Yes | Category label |
-| `stock` | integer | No | Default `0` |
-
-**Example:**
-
-```bash
-curl -X POST http://localhost:3000/api/products \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Laptop","price":999.99,"category":"Electronics","stock":50}'
-```
-
-**Response `201`:**
-```json
-{
-  "data": {
-    "id": "uuid",
-    "name": "Laptop",
-    "description": null,
-    "price": 999.99,
-    "category": "Electronics",
-    "stock": 50,
-    "createdAt": "2024-01-01T00:00:00.000Z",
-    "updatedAt": "2024-01-01T00:00:00.000Z"
-  }
-}
-```
-
----
-
-#### List products
-
-```
-GET /api/products
-```
-
-**Query parameters:**
-
-| Param | Type | Description |
-|---|---|---|
-| `category` | string | Filter by exact category |
-| `minPrice` | number | Minimum price |
-| `maxPrice` | number | Maximum price |
-| `search` | string | Case-insensitive search in name and description |
-| `sortBy` | string | Sort field: `name`, `price`, `stock`, `category`, `createdAt` (default: `createdAt`) |
-| `sortOrder` | string | `asc` or `desc` (default: `desc`) |
-| `page` | integer | Page number (default: `1`) |
-| `limit` | integer | Items per page, max 100 (default: `10`) |
-
-**Example:**
-
-```bash
-curl "http://localhost:3000/api/products?category=Electronics&minPrice=100&page=1&limit=5"
-```
-
-**Response `200`:**
-```json
-{
-  "data": [...],
-  "pagination": {
-    "total": 42,
-    "page": 1,
-    "limit": 5,
-    "totalPages": 9
-  }
-}
-```
-
----
-
-#### Get a product
-
-```
-GET /api/products/:id
-```
-
-**Example:**
-
-```bash
-curl http://localhost:3000/api/products/some-uuid
-```
-
-**Response `200`:** `{ "data": { ... } }`
-**Response `404`:** `{ "error": "Product not found" }`
-
----
-
-#### Update a product (full)
-
-```
-PUT /api/products/:id
-Content-Type: application/json
-```
-
-All fields are optional. Only provided fields are updated. Use when sending multiple fields at once.
-
-**Example:**
-
-```bash
-curl -X PUT http://localhost:3000/api/products/some-uuid \
-  -H "Content-Type: application/json" \
-  -d '{"price":799.99,"stock":30}'
-```
-
-**Response `200`:** `{ "data": { ... } }`
-**Response `404`:** `{ "error": "Product not found" }`
-
----
-
-#### Partially update a product
-
-```
-PATCH /api/products/:id
-Content-Type: application/json
-```
-
-Send only the single field you want to change. Semantically preferred over `PUT` for single-field updates.
-
-**Fields:** `name`, `description`, `price`, `category`, `stock` — all optional, at least one required.
-
-**Examples:**
-
-```bash
-# Update price only
-curl -X PATCH http://localhost:3000/api/products/some-uuid \
-  -H "Content-Type: application/json" \
-  -d '{"price":19.99}'
-
-# Update stock only
-curl -X PATCH http://localhost:3000/api/products/some-uuid \
-  -H "Content-Type: application/json" \
-  -d '{"stock":0}'
-```
-
-**Response `200`:** `{ "data": { ... } }`
-**Response `400`:** `{ "error": "No fields to update" }` — if body is empty
-**Response `404`:** `{ "error": "Product not found" }`
-
----
-
-#### Delete a product
-
-```
-DELETE /api/products/:id
-```
-
-**Example:**
-
-```bash
-curl -X DELETE http://localhost:3000/api/products/some-uuid
-```
-
-**Response `204`:** No content.
-**Response `404`:** `{ "error": "Product not found" }`
+- **Swagger UI:** `http://localhost:3000/api-docs`
+- **OpenAPI JSON:** `http://localhost:3000/api-docs.json`
 
 ---
 
@@ -352,7 +217,10 @@ problem-2/
 │   ├── logger.ts                 # Pino logger instance
 │   └── swagger.ts                # OpenAPI spec definition
 ├── drizzle.config.ts             # Drizzle Kit config (auto-selects dialect)
-├── .env.example                  # Template for environment variables
+├── Dockerfile                    # Multi-stage build (builder + production)
+├── docker-compose.yml            # App + PostgreSQL with built-in env vars
+├── .dockerignore
+├── .env.example                  # Template for local environment variables
 ├── package.json
 ├── tsconfig.json
 └── README.md
