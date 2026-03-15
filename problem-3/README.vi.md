@@ -2,26 +2,25 @@
 
 ## Mục Lục
 
-1. [Tổng Quan](#tổng-quan)
-2. [Thiết Kế Cấp Cao](#1-thiết-kế-cấp-cao)
+1. [Thiết Kế Cấp Cao](#1-thiết-kế-cấp-cao)
    - [Bối Cảnh Nghiệp Vụ](#11-bối-cảnh-nghiệp-vụ)
    - [Sơ Đồ Ngữ Cảnh Hệ Thống](#12-sơ-đồ-ngữ-cảnh-hệ-thống)
    - [Các Quyết Định Thiết Kế Chính](#13-các-quyết-định-thiết-kế-chính)
-3. [Thiết Kế Cấp Trung](#2-thiết-kế-cấp-trung)
+2. [Thiết Kế Cấp Trung](#2-thiết-kế-cấp-trung)
    - [Kiến Trúc Thành Phần](#21-kiến-trúc-thành-phần)
    - [Trách Nhiệm Của Từng Module](#22-trách-nhiệm-của-từng-module)
    - [Lựa Chọn Công Nghệ](#23-lựa-chọn-công-nghệ)
-4. [Thiết Kế Cấp Thấp](#3-thiết-kế-cấp-thấp)
+3. [Thiết Kế Cấp Thấp](#3-thiết-kế-cấp-thấp)
    - [Tài Liệu API](#31-tài-liệu-api)
    - [Giao Thức WebSocket](#32-giao-thức-websocket)
    - [Sơ Đồ Tuần Tự Cập Nhật Điểm](#33-sơ-đồ-tuần-tự-cập-nhật-điểm)
    - [Vòng Đời WebSocket](#34-vòng-đời-websocket)
    - [Mô Hình Bảo Mật](#35-mô-hình-bảo-mật)
-   - [Mô Hình Dữ Liệu](#36-mô-hình-dữ-liệu)
+   - [Thiết Kế Cơ Sở Dữ Liệu](#36-thiết-kế-cơ-sở-dữ-liệu)
    - [Mã Lỗi](#37-mã-lỗi)
    - [Cấu Hình](#38-cấu-hình)
-5. [Thiết Kế Khả Năng Mở Rộng](#4-thiết-kế-khả-năng-mở-rộng)
-6. [Đề Xuất Cải Tiến](#5-đề-xuất-cải-tiến)
+4. [Thiết Kế Khả Năng Mở Rộng](#4-thiết-kế-khả-năng-mở-rộng)
+5. [Đề Xuất Cải Tiến](#5-đề-xuất-cải-tiến)
 
 ---
 

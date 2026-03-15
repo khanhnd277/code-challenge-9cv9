@@ -2,26 +2,25 @@
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [High-Level Design](#1-high-level-design)
+1. [High-Level Design](#1-high-level-design)
    - [Business Context](#11-business-context)
    - [System Context Diagram](#12-system-context-diagram)
    - [Key Design Decisions](#13-key-design-decisions)
-3. [Mid-Level Design](#2-mid-level-design)
+2. [Mid-Level Design](#2-mid-level-design)
    - [Component Architecture](#21-component-architecture)
    - [Module Responsibilities](#22-module-responsibilities)
    - [Technology Choices](#23-technology-choices)
-4. [Low-Level Design](#3-low-level-design)
+3. [Low-Level Design](#3-low-level-design)
    - [API Reference](#31-api-reference)
    - [WebSocket Protocol](#32-websocket-protocol)
    - [Score Update Sequence](#33-score-update-sequence-diagram)
    - [WebSocket Lifecycle](#34-websocket-lifecycle-diagram)
    - [Security Model](#35-security-model)
-   - [Data Models](#36-data-models)
+   - [Database Design](#36-database-design)
    - [Error Codes](#37-error-codes)
    - [Configuration](#38-configuration)
-5. [Scalability Design](#4-scalability-design)
-6. [Improvement Recommendations](#5-improvement-recommendations)
+4. [Scalability Design](#4-scalability-design)
+5. [Improvement Recommendations](#5-improvement-recommendations)
 
 ---
 
