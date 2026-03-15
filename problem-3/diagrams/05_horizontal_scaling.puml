@@ -1,0 +1,59 @@
+@startuml 05_horizontal_scaling
+!theme plain
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName Arial
+
+title Horizontal Scaling - Multi-Instance WebSocket Broadcast via Redis Pub/Sub
+
+rectangle "Client A" as CA
+rectangle "Client B" as CB
+rectangle "Client C" as CC
+
+node "Load Balancer" as LB
+
+node "API Server Instance 1" as S1 {
+  component "WS Hub 1" as WS1
+  component "Score Service" as SS1
+}
+
+node "API Server Instance 2" as S2 {
+  component "WS Hub 2" as WS2
+}
+
+node "API Server Instance 3" as S3 {
+  component "WS Hub 3" as WS3
+}
+
+database "Redis\nSorted Set + Pub/Sub" as Redis
+database "PostgreSQL" as PG
+
+CA --> LB : WebSocket
+CB --> LB : WebSocket
+LB --> WS1 : WS conn - Client A
+LB --> WS2 : WS conn - Client B
+LB --> WS3 : WS conn - Client C
+
+CC --> LB : POST /scores/update
+LB --> SS1 : Route request
+
+SS1 --> PG : Atomic DB write
+SS1 --> Redis : ZADD leaderboard
+SS1 --> Redis : PUBLISH scoreboard_channel
+
+Redis --> WS1 : SUBSCRIBE callback
+Redis --> WS2 : SUBSCRIBE callback
+Redis --> WS3 : SUBSCRIBE callback
+
+WS1 --> CA : scoreboard:update
+WS2 --> CB : scoreboard:update
+WS3 --> CC : scoreboard:update
+
+note bottom of Redis
+  All server instances subscribe
+  to the same Pub/Sub channel.
+  Any instance that processes
+  a score update triggers
+  broadcast across all instances.
+end note
+
+@enduml

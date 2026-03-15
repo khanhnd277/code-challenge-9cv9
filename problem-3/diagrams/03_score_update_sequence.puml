@@ -1,0 +1,85 @@
+@startuml 03_score_update_sequence
+!theme plain
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName Arial
+
+title Score Update — Detailed Sequence (Happy Path & Failure Paths)
+
+actor "Client\n(Browser)" as Client
+participant "REST Router" as Router
+participant "Auth Middleware" as Auth
+participant "Rate Limiter\n(Redis)" as Rate
+participant "Idempotency Guard\n(DB)" as Idem
+participant "Score Service" as Svc
+participant "DB\n(PostgreSQL)" as DB
+participant "Redis\nLeaderboard" as Redis
+participant "WebSocket Hub" as WSHub
+
+== Happy Path ==
+
+Client -> Router : POST /api/v1/scores/update\nAuthorization: Bearer <JWT>\n{ action_id: "<uuid>" }
+
+Router -> Auth : Validate JWT
+Auth -> Auth : Decode & verify signature\nCheck exp, iat claims
+Auth --> Router : user_id extracted
+
+Router -> Rate : Check user_id rate bucket
+Rate -> Rate : Sliding window check in Redis\nKEY: rate:<user_id>
+Rate --> Router : OK (within limit)
+
+Router -> Idem : Check action_id uniqueness
+Idem -> DB : SELECT FROM processed_actions\nWHERE action_id = ?
+DB --> Idem : Not found
+Idem --> Router : OK (new action)
+
+Router -> Svc : incrementScore(user_id, action_id)
+
+Svc -> DB : BEGIN TRANSACTION
+Svc -> DB : INSERT INTO processed_actions\n(action_id, user_id, processed_at)
+Svc -> DB : UPDATE users\nSET score = score + <delta>\nWHERE id = user_id\nRETURNING score
+DB --> Svc : new_score = 1450
+Svc -> DB : COMMIT
+
+Svc -> Redis : ZADD leaderboard 1450 user_id
+Svc -> Redis : ZREVRANGE leaderboard 0 9 WITHSCORES
+Redis --> Svc : top10[]
+
+Svc -> Redis : ZREVRANK leaderboard user_id
+Redis --> Svc : rank = 2
+
+Svc -> WSHub : broadcast scoreboard:update\n{ top10[] }
+WSHub --> Client : [WS] scoreboard:update event\n(all connected clients)
+
+Svc --> Router : { user_id, new_score: 1450, rank: 3 }
+Router --> Client : 200 OK\n{ user_id, new_score, rank }
+
+== Failure: Invalid / Expired JWT ==
+
+Client -> Router : POST ... (expired token)
+Router -> Auth : Validate JWT
+Auth --> Router : 401 UNAUTHORIZED
+Router --> Client : 401 { code: "UNAUTHORIZED" }
+
+== Failure: Rate Limit Exceeded ==
+
+Client -> Router : POST ... (too many requests)
+Router -> Auth : Validate JWT
+Auth --> Router : OK
+Router -> Rate : Check bucket
+Rate --> Router : 429 RATE_LIMIT_EXCEEDED\nRetry-After: 42s
+Router --> Client : 429 { code: "RATE_LIMIT_EXCEEDED" }
+
+== Failure: Duplicate action_id ==
+
+Client -> Router : POST ... (replay)
+Router -> Auth : Validate JWT
+Auth --> Router : OK
+Router -> Rate : Check bucket
+Rate --> Router : OK
+Router -> Idem : Check action_id
+Idem -> DB : SELECT ... (found)
+DB --> Idem : Row exists
+Idem --> Router : 409 ALREADY_PROCESSED
+Router --> Client : 409 { code: "ALREADY_PROCESSED" }
+
+@enduml

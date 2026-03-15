@@ -1,0 +1,62 @@
+@startuml 04_websocket_lifecycle
+!theme plain
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName Arial
+
+title WebSocket Connection Lifecycle
+
+actor "Client" as Client
+participant "WS Handler" as WS
+participant "Auth Middleware" as Auth
+participant "WebSocket Hub" as Hub
+participant "Redis\n(Leaderboard)" as Redis
+participant "Redis\n(Pub/Sub)" as PubSub
+
+== Connection Establishment ==
+
+Client -> WS : HTTP Upgrade\nGET /ws/scoreboard?token=<JWT>
+WS -> Auth : Validate JWT from query param / header
+Auth --> WS : user_id (or 401 → close)
+WS -> Hub : Register(conn, user_id)
+Hub -> Redis : ZREVRANGE leaderboard 0 9 WITHSCORES
+Redis --> Hub : top10[]
+Hub -> Client : [WS] scoreboard:init\n{ top10[] }
+
+== Heartbeat (Keepalive) ==
+
+loop Every 30 seconds
+  Hub -> Client : PING frame
+  Client -> Hub : PONG frame
+end
+
+== Score Update Broadcast (triggered by Score Service) ==
+
+note over PubSub : Score Service publishes\nafter successful update
+PubSub -> Hub : scoreboard:update message\n{ top10[] }
+Hub -> Client : [WS] scoreboard:update\n{ top10[] }
+note right of Hub
+  Broadcast to ALL
+  registered connections
+  on this server instance
+end note
+
+== Idle Timeout ==
+
+Hub -> Hub : No PONG received\nfor > 60s
+Hub -> Client : Close frame (code 1000)
+Hub -> Hub : Deregister(conn)
+
+== Client Reconnect Strategy ==
+
+Client -> Client : Detect close / error
+Client -> Client : Wait: 1s → 2s → 4s ... max 30s\n(exponential backoff)
+Client -> WS : Reconnect with fresh JWT
+
+== Token Expiry During Session ==
+
+Hub -> Hub : Detect JWT exp < now()
+Hub -> Client : Close frame (code 4001 — token expired)
+Client -> Client : Obtain fresh token from Auth Service
+Client -> WS : Reconnect with new JWT
+
+@enduml

@@ -1,0 +1,41 @@
+@startuml 01_system_context
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName Arial
+skinparam rectangleBorderColor #555555
+skinparam rectangleFontSize 13
+skinparam databaseBorderColor #555555
+skinparam noteBorderColor #AAAAAA
+skinparam noteBackgroundColor #FFFFF0
+skinparam arrowColor #333333
+
+title System Context - Score Update & Live Leaderboard
+
+rectangle "User\n(Browser / App)" as User #DDEEFF
+rectangle "External Auth Service\n(Out of scope)" as AuthService #FFF9C4
+rectangle "API Server\n(This Module)" as APIServer #C8E6C9
+database "PostgreSQL\n(Persistent Store)" as DB #B3E5FC
+database "Redis\n(Cache & Pub/Sub)" as Redis #FFCCBC
+rectangle "Other Connected\nClients" as Clients #DDEEFF
+
+User --> APIServer : POST /api/v1/scores/update
+User --> APIServer : WS /ws/scoreboard
+AuthService ..> APIServer : issues JWT verified here
+APIServer --> DB : persist score & processed_actions
+APIServer --> Redis : ZADD leaderboard / PUBLISH event
+APIServer --> Clients : scoreboard:update via WebSocket
+
+note right of APIServer
+  This module owns:
+  - Score update REST endpoint
+  - WebSocket hub
+  - Rate limiting
+  - Idempotency guard
+  - Leaderboard cache management
+end note
+
+note right of AuthService
+  Tokens are issued externally.
+  This module only verifies them.
+end note
+
+@enduml

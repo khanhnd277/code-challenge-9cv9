@@ -1,0 +1,56 @@
+@startuml 02_component_architecture
+!theme plain
+skinparam backgroundColor #FAFAFA
+skinparam defaultFontName Arial
+skinparam componentStyle rectangle
+
+title Component Architecture - API Server (Mid-Level)
+
+package "API Server" {
+
+  package "Transport Layer" {
+    component "REST Router\nPOST /api/v1/scores/update" as REST
+    component "WebSocket Handler\nWS /ws/scoreboard" as WSHandler
+  }
+
+  package "Middleware Chain" {
+    component "Auth Middleware\n(JWT Validation)" as AuthMW
+    component "Rate Limiter\n(Token Bucket / Sliding Window)" as RateMW
+    component "Idempotency Guard\n(action_id dedup)" as IdempMW
+  }
+
+  package "Business Logic" {
+    component "Score Service\n(Orchestration)" as ScoreSvc
+    component "Leaderboard Service\n(Top-N query)" as LBSvc
+  }
+
+  package "Infrastructure Adapters" {
+    component "DB Repository\n(users, processed_actions)" as DBRepo
+    component "Redis Adapter\n(Sorted Set + Pub/Sub)" as RedisAdapter
+    component "WebSocket Hub\n(Connection Registry)" as WSHub
+  }
+
+}
+
+database "PostgreSQL" as PG
+database "Redis" as RD
+
+REST --> AuthMW
+AuthMW --> RateMW
+RateMW --> IdempMW
+IdempMW --> ScoreSvc
+
+ScoreSvc --> DBRepo : atomic increment + record action
+ScoreSvc --> LBSvc : refresh leaderboard
+LBSvc --> RedisAdapter : ZADD / ZREVRANGE
+ScoreSvc --> WSHub : publish scoreboard:update
+
+WSHandler --> AuthMW : JWT handshake
+WSHandler --> WSHub : register connection
+WSHub --> RedisAdapter : subscribe Pub/Sub
+
+DBRepo --> PG
+RedisAdapter --> RD
+WSHub --> RD : Pub/Sub
+
+@enduml
