@@ -359,41 +359,183 @@ Vượt giới hạn trả về `429` kèm header `Retry-After: <giây>`.
 
 ---
 
-### 3.6 Mô Hình Dữ Liệu
+### 3.6 Thiết Kế Cơ Sở Dữ Liệu
 
-#### Bảng `users` (các cột liên quan)
+#### 3.6.1 Sơ Đồ Thực Thể - Quan Hệ (ERD)
+
+```
+┌─────────────────────────────┐        ┌──────────────────────────────────┐
+│            users             │        │        processed_actions          │
+├─────────────────────────────┤        ├──────────────────────────────────┤
+│ PK  id           VARCHAR(64) │◄───────│ PK  action_id    UUID             │
+│     username     VARCHAR(100)│  1:N   │ FK  user_id      VARCHAR(64)      │
+│     score        BIGINT      │        │     processed_at TIMESTAMPTZ      │
+│     updated_at   TIMESTAMPTZ │        └──────────────────────────────────┘
+└─────────────────────────────┘
+            │
+            │ 1:N  (tùy chọn — Cải tiến #6)
+            ▼
+┌────────────────────────────────────────────────────────┐
+│                     score_audit_log                     │
+├────────────────────────────────────────────────────────┤
+│ PK  id               BIGSERIAL                          │
+│     user_id          VARCHAR(64)   -- phi chuẩn hóa    │
+│     action_id        UUID                               │
+│     delta            INT                                │
+│     score_before     BIGINT                             │
+│     score_after      BIGINT                             │
+│     ip_address       INET                               │
+│     outcome          VARCHAR(20)   -- success/rejected  │
+│     rejection_reason VARCHAR(50)                        │
+│     created_at       TIMESTAMPTZ                        │
+└────────────────────────────────────────────────────────┘
+```
+
+#### 3.6.2 PostgreSQL — DDL Đầy Đủ
+
+##### Bảng `users`
 
 ```sql
 CREATE TABLE users (
-  id          VARCHAR(64)  PRIMARY KEY,
-  username    VARCHAR(100) NOT NULL,
-  score       BIGINT       NOT NULL DEFAULT 0,
-  updated_at  TIMESTAMP    NOT NULL DEFAULT NOW()
+  id          VARCHAR(64)   PRIMARY KEY,
+  username    VARCHAR(100)  NOT NULL,
+  score       BIGINT        NOT NULL DEFAULT 0,
+  updated_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_score_non_negative CHECK (score >= 0)
 );
+
+-- Hỗ trợ truy vấn seed bảng xếp hạng khi server khởi động
+CREATE INDEX idx_users_score_desc ON users (score DESC);
 ```
 
-#### Bảng `processed_actions`
+##### Bảng `processed_actions`
 
 ```sql
 CREATE TABLE processed_actions (
-  action_id    UUID        PRIMARY KEY,
-  user_id      VARCHAR(64) NOT NULL REFERENCES users(id),
-  processed_at TIMESTAMP   NOT NULL DEFAULT NOW()
+  action_id    UUID          PRIMARY KEY,           -- idempotency key
+  user_id      VARCHAR(64)   NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  processed_at TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_processed_actions_user ON processed_actions(user_id);
+-- Hỗ trợ truy vấn lịch sử theo user và cron job dọn dẹp
+CREATE INDEX idx_processed_actions_user    ON processed_actions (user_id);
+CREATE INDEX idx_processed_actions_cleanup ON processed_actions (processed_at);
 ```
 
-> **Lưu ý:** Thêm một scheduled job để chuyển các hàng cũ hơn 30 ngày sang cold storage. Cửa sổ 30 ngày cung cấp khả năng bảo vệ replay đủ trong khi ngăn bảng tăng trưởng vô hạn. Xem [Cải tiến #7](#7-lưu-trữ-processed_actions).
+> **Ràng buộc quan trọng:** `action_id` là PRIMARY KEY nên lookup idempotency là O(1) — không cần index riêng.
 
-#### Redis Sorted Set
+> **Dọn dẹp:** Chạy cron hàng đêm để xóa các hàng cũ hơn 30 ngày. Cửa sổ 30 ngày cung cấp khả năng bảo vệ replay đủ trong khi ngăn bảng tăng trưởng vô hạn. Xem [Cải tiến #7](#7-lưu-trữ-processed_actions).
 
-| Key | Member | Score |
-|-----|--------|-------|
-| `leaderboard` | `user_id` | điểm số (đồng bộ với DB) |
+##### Bảng `score_audit_log` *(tùy chọn — Cải tiến #6)*
 
-- Được coi là **nhất quán cuối cùng** với PostgreSQL.
-- Khi server khởi động, khởi tạo sorted set từ top N user trong DB.
+```sql
+CREATE TABLE score_audit_log (
+  id               BIGSERIAL     PRIMARY KEY,
+  user_id          VARCHAR(64)   NOT NULL,  -- phi chuẩn hóa; không FK để tránh lock contention
+  action_id        UUID,
+  delta            INT           NOT NULL DEFAULT 0,
+  score_before     BIGINT        NOT NULL,
+  score_after      BIGINT        NOT NULL,
+  ip_address       INET,
+  outcome          VARCHAR(20)   NOT NULL,        -- 'success' | 'rejected' | 'error'
+  rejection_reason VARCHAR(50),                   -- 'rate_limit' | 'duplicate' | 'invalid_jwt' | NULL
+  created_at       TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (created_at);               -- partition theo tháng để tối ưu hiệu suất truy vấn
+
+CREATE TABLE score_audit_log_y2026m03
+  PARTITION OF score_audit_log
+  FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+
+-- Index hỗ trợ phân tích forensic
+CREATE INDEX idx_audit_user_time ON score_audit_log (user_id, created_at DESC);
+CREATE INDEX idx_audit_rejected  ON score_audit_log (outcome, created_at DESC)
+  WHERE outcome != 'success';
+```
+
+#### 3.6.3 Giao Dịch Nguyên Tử — Cập Nhật Điểm
+
+Toàn bộ quy trình ghi được bọc trong **một giao dịch ACID duy nhất**:
+
+```sql
+BEGIN;
+
+-- Bước 1: Đánh dấu action đã xử lý (chặn replay)
+-- Nếu action_id đã tồn tại → vi phạm PK → ROLLBACK → 409
+INSERT INTO processed_actions (action_id, user_id)
+VALUES ($1, $2);                    -- $1 = action_id, $2 = user_id
+
+-- Bước 2: Tăng điểm nguyên tử
+UPDATE users
+SET    score      = score + $3,     -- $3 = SCORE_DELTA (do server định nghĩa, không do client cung cấp)
+       updated_at = NOW()
+WHERE  id = $2
+RETURNING score AS new_score;
+
+COMMIT;
+```
+
+Cập nhật Redis và phát sóng WebSocket được thực hiện **ngoài giao dịch** sau khi `COMMIT` để tránh giữ row lock trong thời gian I/O.
+
+#### 3.6.4 Redis — Cấu Trúc Dữ Liệu
+
+| Cấu Trúc | Key | Mô Tả | TTL |
+|----------|-----|-------|-----|
+| Sorted Set | `leaderboard` | member = `user_id`, score = điểm số | Không TTL |
+| String | `ratelimit:{user_id}:{window_ts}` | Bộ đếm sliding-window request | = thời gian cửa sổ (60s) |
+| Pub/Sub channel | `scoreboard_channel` | Fanout cập nhật bảng xếp hạng giữa các instance | — |
+
+**Các lệnh Redis chính:**
+
+```
+# Cập nhật bảng xếp hạng sau khi DB commit
+ZADD leaderboard <new_score> <user_id>
+
+# Lấy top 10
+ZREVRANGE leaderboard 0 9 WITHSCORES
+
+# Lấy thứ hạng của một user (0-indexed → +1 để hiển thị)
+ZREVRANK leaderboard <user_id>
+
+# Giới hạn tốc độ — tăng nguyên tử với tự hết hạn
+SET  ratelimit:{user_id}:{window_ts}  0  EX 60  NX   -- khởi tạo nếu chưa có
+INCR ratelimit:{user_id}:{window_ts}                  -- đếm request này
+
+# Phát sóng sau khi cập nhật điểm
+PUBLISH scoreboard_channel <json_payload>
+```
+
+**Khởi tạo bảng xếp hạng khi server khởi động:**
+
+```sql
+-- Truy vấn seed sorted set từ PostgreSQL trước khi chấp nhận kết nối
+SELECT id, score FROM users ORDER BY score DESC LIMIT 100;
+```
+
+```
+ZADD leaderboard <score_1> <user_id_1> <score_2> <user_id_2> ...
+```
+
+Chỉ sau khi `ZADD` hàng loạt hoàn tất, server mới bắt đầu chấp nhận kết nối WebSocket và REST request (xem [Cải tiến #8](#8-khởi-tạo-cache-bảng-xếp-hạng)).
+
+#### 3.6.5 Vòng Đời Dữ Liệu & Dọn Dẹp
+
+| Bảng / Key | Chính sách lưu giữ | Cơ chế |
+|---|---|---|
+| `processed_actions` | 30 ngày | Cron hàng đêm: `DELETE WHERE processed_at < NOW() - INTERVAL '30 days'` |
+| `score_audit_log` | 90 ngày online, 1 năm cold | Drop partition cũ hàng tháng; export sang S3 / data warehouse |
+| Redis `leaderboard` | Vô thời hạn (cache) | Rebuild từ DB khi server khởi động hoặc sau khi flush |
+| Redis `ratelimit:*` | Tự hết hạn | TTL = độ dài cửa sổ (60s) |
+
+#### 3.6.6 Nhất Quán PostgreSQL ↔ Redis
+
+Redis Sorted Set là **cache nhất quán cuối cùng** của cột `score` trong PostgreSQL:
+
+| Tình huống | Hành Vi |
+|---|---|
+| Redis down khi cập nhật điểm | DB commit vẫn thành công; phát sóng WS thất bại nhưng điểm không mất |
+| Redis bị flush hoặc restart | Server seed lại sorted set từ DB khi khởi động lần sau |
+| Redis và DB mất đồng bộ | Chạy job đối chiếu định kỳ hoặc rebuild toàn bộ vào giờ thấp điểm |
 
 ---
 

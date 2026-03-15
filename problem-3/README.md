@@ -359,41 +359,183 @@ Exceeding the limit returns `429` with a `Retry-After: <seconds>` header.
 
 ---
 
-### 3.6 Data Models
+### 3.6 Database Design
 
-#### `users` table (relevant columns)
+#### 3.6.1 Entity-Relationship Diagram (ERD)
+
+```
+┌─────────────────────────────┐        ┌──────────────────────────────────┐
+│            users             │        │        processed_actions          │
+├─────────────────────────────┤        ├──────────────────────────────────┤
+│ PK  id           VARCHAR(64) │◄───────│ PK  action_id    UUID             │
+│     username     VARCHAR(100)│  1:N   │ FK  user_id      VARCHAR(64)      │
+│     score        BIGINT      │        │     processed_at TIMESTAMPTZ      │
+│     updated_at   TIMESTAMPTZ │        └──────────────────────────────────┘
+└─────────────────────────────┘
+            │
+            │ 1:N  (optional — Improvement #6)
+            ▼
+┌────────────────────────────────────────────────────────┐
+│                     score_audit_log                     │
+├────────────────────────────────────────────────────────┤
+│ PK  id               BIGSERIAL                          │
+│     user_id          VARCHAR(64)   -- denormalized      │
+│     action_id        UUID                               │
+│     delta            INT                                │
+│     score_before     BIGINT                             │
+│     score_after      BIGINT                             │
+│     ip_address       INET                               │
+│     outcome          VARCHAR(20)   -- success/rejected  │
+│     rejection_reason VARCHAR(50)                        │
+│     created_at       TIMESTAMPTZ                        │
+└────────────────────────────────────────────────────────┘
+```
+
+#### 3.6.2 PostgreSQL — Full DDL
+
+##### `users` table
 
 ```sql
 CREATE TABLE users (
-  id          VARCHAR(64)  PRIMARY KEY,
-  username    VARCHAR(100) NOT NULL,
-  score       BIGINT       NOT NULL DEFAULT 0,
-  updated_at  TIMESTAMP    NOT NULL DEFAULT NOW()
+  id          VARCHAR(64)   PRIMARY KEY,
+  username    VARCHAR(100)  NOT NULL,
+  score       BIGINT        NOT NULL DEFAULT 0,
+  updated_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_score_non_negative CHECK (score >= 0)
 );
+
+-- Supports leaderboard seed query on server startup
+CREATE INDEX idx_users_score_desc ON users (score DESC);
 ```
 
-#### `processed_actions` table
+##### `processed_actions` table
 
 ```sql
 CREATE TABLE processed_actions (
-  action_id    UUID        PRIMARY KEY,
-  user_id      VARCHAR(64) NOT NULL REFERENCES users(id),
-  processed_at TIMESTAMP   NOT NULL DEFAULT NOW()
+  action_id    UUID          PRIMARY KEY,           -- idempotency key
+  user_id      VARCHAR(64)   NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  processed_at TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_processed_actions_user ON processed_actions(user_id);
+-- Supports per-user history queries and archival cron job
+CREATE INDEX idx_processed_actions_user    ON processed_actions (user_id);
+CREATE INDEX idx_processed_actions_cleanup ON processed_actions (processed_at);
 ```
 
-> **Note:** Add a scheduled archival job to move rows older than 30 days to cold storage. The 30-day window provides adequate replay protection while preventing unbounded table growth. See [Improvement #7](#7-processed_actions-archival).
+> **Key constraint:** `action_id` is the PRIMARY KEY so idempotency lookups are O(1) — no separate index needed.
 
-#### Redis Sorted Set
+> **Archival:** Run a nightly cron to delete rows older than 30 days. The 30-day window provides adequate replay protection while preventing unbounded table growth. See [Improvement #7](#7-processed_actions-archival).
 
-| Key | Member | Score |
-|-----|--------|-------|
-| `leaderboard` | `user_id` | numeric score (mirrors DB) |
+##### `score_audit_log` table *(optional — Improvement #6)*
 
-- Treated as **eventually consistent** with PostgreSQL.
-- On server startup, seed the sorted set from the top N users in the DB.
+```sql
+CREATE TABLE score_audit_log (
+  id               BIGSERIAL     PRIMARY KEY,
+  user_id          VARCHAR(64)   NOT NULL,  -- denormalized; no FK to avoid lock contention
+  action_id        UUID,
+  delta            INT           NOT NULL DEFAULT 0,
+  score_before     BIGINT        NOT NULL,
+  score_after      BIGINT        NOT NULL,
+  ip_address       INET,
+  outcome          VARCHAR(20)   NOT NULL,        -- 'success' | 'rejected' | 'error'
+  rejection_reason VARCHAR(50),                   -- 'rate_limit' | 'duplicate' | 'invalid_jwt' | NULL
+  created_at       TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (created_at);               -- monthly partitions for query performance
+
+CREATE TABLE score_audit_log_y2026m03
+  PARTITION OF score_audit_log
+  FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+
+-- Indexes for forensic queries
+CREATE INDEX idx_audit_user_time ON score_audit_log (user_id, created_at DESC);
+CREATE INDEX idx_audit_rejected  ON score_audit_log (outcome, created_at DESC)
+  WHERE outcome != 'success';
+```
+
+#### 3.6.3 Atomic Transaction — Score Update
+
+The entire write path executes within a **single ACID transaction**:
+
+```sql
+BEGIN;
+
+-- Step 1: Mark action as processed (replay prevention)
+-- If action_id already exists → PK violation → ROLLBACK → 409
+INSERT INTO processed_actions (action_id, user_id)
+VALUES ($1, $2);                    -- $1 = action_id, $2 = user_id
+
+-- Step 2: Atomically increment score
+UPDATE users
+SET    score      = score + $3,     -- $3 = SCORE_DELTA (server-defined, never client-supplied)
+       updated_at = NOW()
+WHERE  id = $2
+RETURNING score AS new_score;
+
+COMMIT;
+```
+
+Redis update and WebSocket broadcast are performed **outside the transaction** after `COMMIT` to avoid holding row locks during I/O.
+
+#### 3.6.4 Redis Data Structures
+
+| Structure | Key | Description | TTL |
+|-----------|-----|-------------|-----|
+| Sorted Set | `leaderboard` | member = `user_id`, score = numeric points | No TTL |
+| String | `ratelimit:{user_id}:{window_ts}` | Sliding-window request counter | = window duration (60s) |
+| Pub/Sub channel | `scoreboard_channel` | Fanout leaderboard updates across server instances | — |
+
+**Key Redis commands:**
+
+```
+# Update leaderboard after DB commit
+ZADD leaderboard <new_score> <user_id>
+
+# Fetch top 10
+ZREVRANGE leaderboard 0 9 WITHSCORES
+
+# Get a user's rank (0-indexed → add 1 for display)
+ZREVRANK leaderboard <user_id>
+
+# Rate limiting — atomic increment with auto-expiry
+SET  ratelimit:{user_id}:{window_ts}  0  EX 60  NX   -- initialise if absent
+INCR ratelimit:{user_id}:{window_ts}                  -- count this request
+
+# Broadcast after score update
+PUBLISH scoreboard_channel <json_payload>
+```
+
+**Leaderboard warm-up on server startup:**
+
+```sql
+-- Seed sorted set from PostgreSQL before accepting connections
+SELECT id, score FROM users ORDER BY score DESC LIMIT 100;
+```
+
+```
+ZADD leaderboard <score_1> <user_id_1> <score_2> <user_id_2> ...
+```
+
+Only after this bulk `ZADD` completes should the server begin accepting WebSocket connections and REST requests (see [Improvement #8](#8-leaderboard-cache-warm-up)).
+
+#### 3.6.5 Data Lifecycle & Cleanup
+
+| Table / Key | Retention | Mechanism |
+|---|---|---|
+| `processed_actions` | 30 days | Nightly cron: `DELETE WHERE processed_at < NOW() - INTERVAL '30 days'` |
+| `score_audit_log` | 90 days online, 1 year cold | Drop old monthly partitions; export to S3 / data warehouse |
+| Redis `leaderboard` | Indefinite (cache) | Rebuild from DB on startup or after flush |
+| Redis `ratelimit:*` | Auto-expire | TTL = window duration (60s) |
+
+#### 3.6.6 PostgreSQL ↔ Redis Consistency
+
+The Redis Sorted Set is an **eventually consistent cache** of the PostgreSQL `score` column:
+
+| Scenario | Behaviour |
+|---|---|
+| Redis is down during a score update | DB commit still succeeds; WS broadcast fails but no score is lost |
+| Redis is flushed or restarted | Server re-seeds the sorted set from DB on next startup |
+| Redis and DB drift out of sync | Run a periodic reconciliation job or schedule a full rebuild during off-peak hours |
 
 ---
 
