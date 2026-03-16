@@ -597,71 +597,252 @@ When deployed across multiple server instances behind a load balancer, WebSocket
 
 The following are not required for the initial implementation but are recommended for production readiness.
 
-### 1. Server-Issued Action Tokens (High Priority)
+### 1. Server-Issued Action Tokens *(High Priority)*
 
-**Problem:** The current spec accepts any client-generated UUID as an `action_id`. A malicious user could fabricate UUIDs to simulate completed actions.
+**Problem:** The current spec accepts any client-generated UUID as an `action_id`. A malicious user can fabricate arbitrary UUIDs to simulate completed actions — the server has no proof the action was genuinely performed.
 
-**Recommendation:** When an action begins, the server issues a short-lived signed `action_token` (JWT or HMAC, TTL ≤ 5 minutes). The score update endpoint verifies this token rather than a bare UUID. This proves the action was legitimately started server-side.
+**Impact:** Without this, a determined attacker who bypasses UI restrictions can craft arbitrary `action_id` values and inflate their score as fast as the rate limiter allows (up to 10 points every 60 seconds, indefinitely).
+
+**Recommendation:** The server issues a short-lived signed `action_token` when an action begins. The score update endpoint verifies this token instead of a bare UUID.
+
+**Implementation options:**
+
+| Option | Mechanism | Trade-off |
+|--------|-----------|-----------|
+| HMAC token | Server signs `{user_id}:{action_type}:{timestamp}` | Stateless; cannot revoke mid-flight |
+| Opaque token + Redis | Random token stored in Redis with TTL | Revocable; requires extra Redis lookup |
+| Self-contained JWT | Short-exp JWT with `action_type` + `user_id` claims | Verifiable without storage; includes built-in expiry |
+
+**Recommended flow:**
 
 ```
-Action Start                         Score Update
-     │                                     │
-     ▼                                     ▼
-Server issues signed action_token  ◄──── Client submits action_token
-(stored server-side or self-contained)     Server verifies + redeems it
+1. User initiates action
+   GET /api/v1/actions/token?type=quiz_complete
+   ← { "action_token": "<signed JWT, TTL 5 min>", "expires_in": 300 }
+
+2. User completes action
+   POST /api/v1/scores/update
+   Body: { "action_token": "<token>" }
+
+3. Server:
+   a. Verify JWT signature + exp claim
+   b. Extract action_type and user_id (from token, never from request body)
+   c. Look up SCORE_DELTA for action_type in config
+   d. Proceed with existing DB transaction
 ```
+
+**Why TTL matters:** A 5-minute window limits the replay window — a captured token is useless after expiry, even if HTTPS is somehow compromised.
+
+---
 
 ### 2. Server-Defined Score Delta
 
-The score increment per action must be **defined entirely on the server**. The client must not supply a `delta` field. This is already reflected in the API spec (`action_id` only), but the implementation must enforce this explicitly—never read a score value from the request body.
+The score increment per action must be **defined entirely on the server**. The client must not supply a `delta` field.
+
+**Why it matters:** If the delta were client-supplied, a user could send `"delta": 999999` and receive a matching score increment.
+
+**Recommended implementation:** Map `action_type` → `delta` in server configuration, not as a hardcoded constant:
+
+```yaml
+# config/score_rules.yaml
+actions:
+  quiz_complete:    delta: 10
+  daily_login:      delta: 5
+  profile_complete: delta: 20
+  referral_signup:  delta: 50
+```
+
+This allows reward values to be adjusted without code changes, and preserves a historical record of which delta was in effect at a given time.
+
+**Enforcement checklist:**
+- Request body schema must NOT accept a `delta` field — the schema validator should reject unknown fields.
+- The DB write must use `score + delta_from_config`, never a value sourced from the request.
+- Unit tests should verify that passing a `delta` field in the body has no effect on the stored score.
+
+---
 
 ### 3. Selective WebSocket Broadcast
 
-**Problem:** Every score update broadcasts the full top-10 to all clients, even if the top-10 did not change (e.g., the user was ranked 500th).
+**Problem:** Every score update broadcasts the full top-10 to all connected clients, even when the top-10 did not change (e.g., the updating user was ranked 500th).
 
-**Recommendation:** Before broadcasting, compare the new top-10 against the last broadcast snapshot. Only broadcast if the list changed. This can reduce WebSocket traffic by 80–90% in a large user base.
+**Impact:** At 10,000 active connections and 100 score updates per second, this generates 1,000,000 WebSocket frames per second — the majority carrying identical, redundant payloads.
+
+**Recommendation:** Before broadcasting, diff the new top-10 against the last broadcast snapshot. Only send if the list changed.
+
+**Implementation:**
+
+```go
+// Pseudo-code (applicable to any language)
+lastSnapshot := cache.GetLastLeaderboardSnapshot()      // in-memory or Redis string
+newTop10     := redis.ZRevRangeWithScores("leaderboard", 0, 9)
+
+if !equal(lastSnapshot, newTop10) {
+    hub.BroadcastAll(ScoreboardUpdateEvent{Top10: newTop10})
+    cache.SetLastLeaderboardSnapshot(newTop10)
+}
+```
+
+**Snapshot storage options:**
+
+| Where | Pro | Con |
+|-------|-----|-----|
+| In-memory (per instance) | Zero latency | Lost on restart; multi-instance may broadcast duplicates |
+| Redis string | Consistent across instances | ~1 extra round-trip per update |
+
+**Expected result:** In a large system, the majority of score updates will not change the top-10, eliminating 80–90% of WebSocket traffic.
+
+---
 
 ### 4. WebSocket Token Refresh
 
-WebSocket connections can be long-lived, but the JWT used at handshake time will expire. Options:
+**Problem:** WebSocket connections are long-lived (hours), but JWTs expire (typically 15 min – 1 hour). When the token expires mid-connection the server must handle this gracefully without losing the leaderboard stream.
 
-- **Option A (simple):** Close the connection when the token expires (code `4001`). Client reconnects with a fresh token.
-- **Option B (seamless):** Implement a client-initiated token refresh message over the WebSocket channel before expiry.
+**Option A — Close on expiry** *(simple, sufficient for v1)*
 
-Option A is sufficient for the initial implementation.
+```
+Every ping cycle (30s), server checks token exp.
+If exp < now → close with code 4001 "TOKEN_EXPIRED".
+Client receives 4001 → fetches new JWT from auth service → reconnects.
+```
+
+Downside: brief gap in leaderboard updates during reconnect (typically < 1 second with exponential backoff starting at 1s).
+
+**Option B — In-band token refresh** *(seamless UX)*
+
+```
+Client sends (proactively, ~60s before expiry):
+{
+  "event": "auth:refresh",
+  "payload": { "token": "<new JWT>" }
+}
+
+Server validates:
+  - Signature valid and not yet expired? → accept
+  - sub claim matches original connection user_id? → accept, replace stored token
+  - sub claim differs? → close with 4003 "IDENTITY_MISMATCH"
+```
+
+Downside: more complex server state; must handle concurrent refresh messages and race conditions.
+
+**Recommendation:** Ship Option A for v1. Instrument reconnect frequency in production; add Option B only if reconnect churn proves disruptive to UX.
+
+---
 
 ### 5. Anomaly Detection
 
-A background service should monitor per-user score velocity over longer windows (hourly, daily). Unusual patterns (e.g., 10× historical average in one hour) should trigger:
-- A flag for manual review, or
-- Automatic temporary suspension pending investigation.
+**Problem:** Rate limiting (10 req/60s) blocks burst abuse, but not slow, sustained cheating — e.g., a bot submitting exactly 9 requests per minute for 8 hours straight.
 
-This is distinct from rate limiting, which only protects short windows.
+**What to monitor:**
+
+| Signal | Suspicious threshold | Suggested action |
+|--------|---------------------|-----------------|
+| Hourly score gain | > 5× user's own 7-day rolling average | Flag for manual review |
+| Daily score gain | > 3× system-wide 99th percentile | Temporary freeze + on-call alert |
+| Sustained request rate | > 80% of rate limit for > 3 consecutive hours | Flag |
+| Rank jump speed | Enters top 100 from unranked in < 1 hour | Alert |
+| New account score | Reaches top 10 within 24h of registration | Alert |
+
+**Implementation approach:**
+
+```
+Background worker (runs every 5–15 minutes, async):
+  1. Aggregate score_audit_log by user_id for the last hour
+  2. Compare against rolling 7-day baseline stored in Redis or a stats table
+  3. Write violations to a review_queue table with severity level
+  4. Trigger on-call alert if severity = HIGH
+```
+
+**Critical:** anomaly checks must run **outside the score update hot path** — never block a legitimate request for background analytics.
+
+---
 
 ### 6. Audit Logging
 
-All score update events (successful and failed) should be written to an immutable append-only audit log with:
+**Problem:** Without a full record of every score update attempt, there is no basis for investigating disputes, cheat allegations, or regulatory inquiries.
 
-| Field | Description |
-|-------|-------------|
-| `user_id` | Who submitted |
-| `action_id` | Which action |
-| `timestamp` | When |
-| `ip_address` | Source IP |
-| `outcome` | `success` / `rejected` / `error` |
-| `rejection_reason` | e.g. `rate_limit`, `duplicate`, `invalid_jwt` |
+**What to log** (all events — success and failure):
 
-This supports forensic analysis and appeals for wrongful blocks.
+| Field | Example | Notes |
+|-------|---------|-------|
+| `user_id` | `user_abc123` | Always from JWT, never from request body |
+| `action_id` | UUID | May be null if rejected before parsing |
+| `ip_address` | `203.0.113.42` | Use `X-Forwarded-For` if behind a reverse proxy |
+| `outcome` | `success` | `success` / `rejected` / `error` |
+| `rejection_reason` | `rate_limit` | `rate_limit` / `duplicate` / `invalid_jwt` / `schema_error` |
+| `score_before` | `1440` | Snapshot before update |
+| `score_after` | `1450` | Snapshot after update |
+| `delta` | `10` | Server-assigned delta only |
+| `created_at` | `2026-03-16T10:30:00Z` | Server timestamp |
+
+**Storage recommendations:**
+- Use the `score_audit_log` table defined in §3.6 (partitioned by month for query performance).
+- Make it append-only: revoke `UPDATE` and `DELETE` privileges from the application's DB user on this table.
+- Export partitions older than 90 days to object storage (S3, GCS) or a data warehouse before dropping them.
+
+**Do NOT log:**
+- JWT token values (security risk — treat as credentials).
+- Any PII fields beyond what is strictly necessary for the use case.
+
+---
 
 ### 7. `processed_actions` Archival
 
-The `processed_actions` table will grow indefinitely. Implement a scheduled job (e.g., nightly cron) to archive rows older than 30 days to a cold-storage table or data warehouse. The 30-day window provides a reasonable replay protection period.
+**Problem:** The `processed_actions` table grows at the rate of score updates — 100K updates/day = 3M rows/month. Without cleanup, it becomes the largest table in the database and degrades idempotency lookup performance over time.
+
+**Why 30 days?** Replay attacks use captured HTTP requests. A 30-day window is long enough to catch any realistic network retry or delayed replay, while short enough to keep the table manageable.
+
+**Simple archival (delete-only):**
+
+```sql
+-- Nightly cron at 02:00 UTC (off-peak)
+DELETE FROM processed_actions
+WHERE processed_at < NOW() - INTERVAL '30 days';
+```
+
+**Safer archival (copy then delete):**
+
+```sql
+-- Step 1: Archive to cold-storage table
+INSERT INTO processed_actions_archive
+SELECT * FROM processed_actions
+WHERE processed_at < NOW() - INTERVAL '30 days';
+
+-- Step 2: Delete from hot table only after archive succeeds
+DELETE FROM processed_actions
+WHERE processed_at < NOW() - INTERVAL '30 days';
+```
+
+**Operational notes:**
+- Run in small batches (`LIMIT 10000` per iteration) to avoid long-running transactions and lock contention during business hours.
+- Alert if the table exceeds a size threshold (e.g., 10M rows) — indicates the cron job has failed silently.
+- Log the row count before and after each archival run for audit purposes.
+
+---
 
 ### 8. Leaderboard Cache Warm-Up
 
-On server startup (or after a Redis flush), the leaderboard sorted set must be seeded from the database. Without this, the first broadcast would show an empty leaderboard.
+**Problem:** After a server restart or Redis flush, the leaderboard sorted set is empty. The first `scoreboard:init` event delivered to connecting clients would show a blank leaderboard until the next score update populates it.
 
-**Suggested startup sequence:**
-1. Query `SELECT id, score FROM users ORDER BY score DESC LIMIT <LEADERBOARD_SIZE * 10>`.
-2. Bulk `ZADD leaderboard` for all returned users.
-3. Only then start accepting WebSocket connections and REST requests.
+**Recommended startup sequence:**
+
+```
+1. Connect to PostgreSQL → run health check query
+2. Connect to Redis → PING
+3. Seed leaderboard sorted set:
+     SELECT id, score FROM users
+     ORDER BY score DESC
+     LIMIT <LEADERBOARD_SIZE * 10>;     -- e.g. 100 rows for top-10 display
+     → ZADD leaderboard <score> <id> [...]
+4. Subscribe to Redis Pub/Sub channel (scoreboard_channel)
+5. Register HTTP and WebSocket route handlers
+6. Begin accepting connections
+```
+
+**Why `LEADERBOARD_SIZE * 10`?** Seeding 10× the display size creates a buffer. Score updates can re-order users around the top-10 boundary — having extra users in the sorted set avoids a full DB re-query just to repopulate a slot.
+
+**Failure handling:**
+
+| Dependency | On failure | Rationale |
+|------------|-----------|-----------|
+| PostgreSQL unavailable | Refuse to start (fail fast) | Cannot serve correct data without the source of truth |
+| Redis unavailable | Start in degraded mode: REST only; reject WS connections until Redis recovers | Score writes still succeed; live leaderboard is paused, not lost |
